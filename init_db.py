@@ -1,7 +1,7 @@
-from app.database import engine, Base
-from app.models import Produto, Pedido, ItemPedido # Importe TODOS os models aqui
+"""Cria as tabelas no banco configurado em DATABASE_URL. Uso: python init_db.py"""
+from app.database import Base, engine
+from app import models  # noqa: F401  (registra os models no metadata)
 
-# Isso é o comando mágico que cria as tabelas no Postgres
-print("Criando tabelas no Banco de Dados...")
-Base.metadata.create_all(bind=engine)
-print("Tabelas criadas com sucesso!")
+if __name__ == "__main__":
+    Base.metadata.create_all(bind=engine)
+    print("Tabelas criadas.")

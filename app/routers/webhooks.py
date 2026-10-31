@@ -1,38 +1,65 @@
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import ValidationError
 from sqlalchemy.orm import Session
+
 from app.database import get_db
 from app.models import Pedido
-from app.schemas import WebhookPagamentoMock, StatusPedido
+from app.order_status import ORIGEM_PAGAMENTO
+from app.schemas import StatusPedido, WebhookPagamento
+from app.security import verificar_assinatura_webhook
 
-router = APIRouter(
-    prefix="/webhooks",
-    tags=["Webhooks (Integracao)"],
-)
+logger = logging.getLogger(__name__)
 
-@router.post ("/pagamento-simulado", status_code=status.HTTP_200_OK)
+router = APIRouter(prefix="/webhooks", tags=["Webhooks"])
+
+
+@router.post("/pagamento", status_code=status.HTTP_200_OK)
 def receber_webhook_pagamento(
-        webhook_data: WebhookPagamentoMock,
-        db: Session = Depends(get_db)
+    body: bytes = Depends(verificar_assinatura_webhook),
+    db: Session = Depends(get_db),
 ):
     """
-    Simula o recebimento de um Webhook de pagamento.
-    Se 'status_transacao' for 'aprovado', move o pedido para PAGO.
+    Recebe a confirmação de pagamento do gateway (assinada com HMAC-SHA256).
+
+    - **aprovado**: move o pedido de CRIADO para PAGO e registra a transação.
+    - **recusado**: não altera o pedido.
+    - A mesma transação reenviada é ignorada (idempotência por `id_transacao_gateway`).
     """
-    print(f"📡 Webhook recebido: {webhook_data}") # Log simples para debug)
+    try:
+        evento = WebhookPagamento.model_validate_json(body)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors(include_url=False, include_context=False))
 
-    pedido = db.query(Pedido).filter(Pedido.id == webhook_data.pedido_id).first()
+    logger.info("Webhook de pagamento: pedido=%s transacao=%s status=%s",
+                evento.pedido_id, evento.id_transacao_gateway, evento.status_transacao)
 
+    pedido = db.get(Pedido, evento.pedido_id, with_for_update=True)
     if not pedido:
         raise HTTPException(status_code=404, detail="Pedido não encontrado para este pagamento")
-    if pedido.status == StatusPedido.PAGO:
-        return  {"msg": "Webhook processado anteriormente (Idempotência garantida)."}
-    elif webhook_data.status_transacao.lower() == "aprovado":
-        pedido.status = StatusPedido.PAGO
-        db.commit()
-        db.refresh(pedido)
-        return {"msg": f"Pedido {pedido.id} atualizado para PAGO com sucesso via Webhook."}
-    elif webhook_data.status_transacao.lower() == "recusado":
-        # Poderíamos ter um status CANCELADO ou PAGAMENTO_FALHOU
-        return {"msg": "Pagamento recusado pelo gateway. Status do pedido inalterado."}
-    else:
-        raise HTTPException(status_code=400, detail="Status de transacao desconhecido")
+
+    # Reentrega da mesma notificação: responde 200 sem efeito colateral
+    if pedido.id_transacao_gateway == evento.id_transacao_gateway:
+        return {"msg": "Notificação já processada.", "status": pedido.status}
+
+    if evento.status_transacao == "recusado":
+        return {"msg": "Pagamento recusado pelo gateway. Pedido inalterado.", "status": pedido.status}
+
+    if pedido.status != ORIGEM_PAGAMENTO:
+        # Pedido já pago por outra transação, cancelado ou em andamento: não regride o fluxo
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Pedido em '{pedido.status}' não pode receber pagamento.",
+        )
+
+    transacao_em_uso = (
+        db.query(Pedido.id).filter(Pedido.id_transacao_gateway == evento.id_transacao_gateway).first()
+    )
+    if transacao_em_uso:
+        raise HTTPException(status_code=409, detail="Transação já usada em outro pedido.")
+
+    pedido.status = StatusPedido.PAGO.value
+    pedido.id_transacao_gateway = evento.id_transacao_gateway
+    db.commit()
+    return {"msg": f"Pedido {pedido.id} pago.", "status": pedido.status}

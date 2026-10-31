@@ -3,4 +3,5 @@ __pycache__/
 *.pyc
 .env
 .idea/
-restaurante.db
+.pytest_cache/
+*.db

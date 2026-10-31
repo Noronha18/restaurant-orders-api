@@ -1,33 +1,28 @@
-import sys
-import os
+"""Popula o cardápio com dados de exemplo. Uso: python -m app.scripts.seed"""
+from decimal import Decimal
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-
-from app.database import Base, SessionLocal, engine
+from app.database import SessionLocal
 from app.models import Produto
 
-def popular_banco():
-    db = SessionLocal()
+CARDAPIO = [
+    ("Burger da Casa", "Lanches", "45.90"),
+    ("Smash Burger Duplo", "Lanches", "28.50"),
+    ("Batata Frita Rústica", "Acompanhamentos", "18.00"),
+    ("Refrigerante Lata 350ml", "Bebidas", "6.50"),
+    ("Suco de Laranja Natural", "Bebidas", "12.00"),
+    ("Pudim de Leite", "Sobremesas", "15.00"),
+]
 
-    if db.query(Produto).count() == 0:
-        print("⚠️  O banco já contém produtos. Pulei o seed.")
-        return
 
-    print("🌱 Semeando o banco de dados...")
+def popular_banco() -> None:
+    with SessionLocal() as db:
+        if db.query(Produto).count() > 0:
+            print("O banco já contém produtos. Seed ignorado.")
+            return
+        db.add_all(Produto(nome=n, categoria=c, preco_atual=Decimal(p)) for n, c, p in CARDAPIO)
+        db.commit()
+        print(f"{len(CARDAPIO)} produtos adicionados.")
 
-    cardapio = [
-        Produto(nome="Monaci Burger Premium", categoria="Lanches", preco_atual=45.90),
-        Produto(nome="Smash Burger Duplo", categoria="Lanches", preco_atual=28.50),
-        Produto(nome="Batata Frita Rústica", categoria="Acompanhamentos", preco_atual=18.00),
-        Produto(nome="Coca-Cola Zero 350ml", categoria="Bebidas", preco_atual=6.50),
-        Produto(nome="Suco de Laranja Natural", categoria="Bebidas", preco_atual=12.00),
-        Produto(nome="Pudim de Leite", categoria="Sobremesas", preco_atual=15.00),
-    ]
-
-    db.add_all(cardapio)
-    db.commit()
-    print(f"✅ Sucesso! {len(cardapio)} produtos adicionados.")
-    db.close()
 
 if __name__ == "__main__":
     popular_banco()

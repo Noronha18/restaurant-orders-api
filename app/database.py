@@ -1,17 +1,12 @@
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, declarative_base
-import os
+from sqlalchemy.orm import declarative_base, sessionmaker
 
+from app.config import settings
 
-# ATENÇÃO: A string de conexão do Postgres tem este formato:
-# postgresql://usuario:senha@localhost:porta/nome_banco
-DATABASE_URL = "postgresql://postgres:minhasenha@localhost:5433/restaurante_db"
-
-# Para Postgres, NÃO precisamos do connect_args={"check_same_thread": False}
-engine = create_engine(DATABASE_URL)
-
+engine = create_engine(settings.DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+
 
 def get_db():
     db = SessionLocal()

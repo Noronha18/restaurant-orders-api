@@ -1,71 +1,103 @@
-# tests/test_fluxo_pedidos.py
-from app.schemas import StatusPedido
+from decimal import Decimal
 
 
-def test_ciclo_completo_pedido(client):
-    # --- CENÁRIO: CRIAR PRODUTO ---
-    payload_produto = {
-        "nome": "X-Bacon Senior",
-        "descricao": "O melhor da casa",  # Adicionei pois pode ser útil, mesmo sendo opcional
-        "preco": 35.00,  # CORREÇÃO: era 'preco_atual'
-        "categoria": "Lanches"
-        # REMOVIDO: "disponivel": True (Seu schema não tem esse campo)
-    }
-    resp_prod = client.post("/produtos/", json=payload_produto)
-    assert resp_prod.status_code == 201
-    id_produto = resp_prod.json()["id"]
+def _pagar(enviar_webhook, pedido_id, tx="tx_123", status="aprovado"):
+    return enviar_webhook({"pedido_id": pedido_id, "status_transacao": status, "id_transacao_gateway": tx})
 
-    # --- CENÁRIO: CRIAR PEDIDO (CLIENTE) ---
-    payload_pedido = {
-        "itens": [
-            {"produto_id": id_produto, "quantidade": 2}
-        ]
-    }
-    resp_pedido = client.post("/pedidos/", json=payload_pedido)
-    assert resp_pedido.status_code == 201
-    dados_pedido = resp_pedido.json()
-    id_pedido = dados_pedido["id"]
 
-    # Validações iniciais
-    assert dados_pedido["status"] == "CRIADO"
-    # assert dados_pedido["total"] == 70.00  # 2 * 35.00
+# --- Fluxo feliz ---
 
-    # --- CENÁRIO: PAGAMENTO (WEBHOOK) ---
-    payload_webhook = {
-        "pedido_id": id_pedido,
-        "status_transacao": "aprovado",
-        "id_transacao_gateway": "tx_test_123"
-    }
-    resp_webhook = client.post("/webhooks/pagamento-simulado", json=payload_webhook)
+def test_ciclo_completo_do_pedido(client, enviar_webhook, pedido_criado):
+    pid = pedido_criado["id"]
+    assert pedido_criado["status"] == "CRIADO"
+    assert Decimal(pedido_criado["total"]) == Decimal("70.00")
 
-    # --- ADICIONE ISTO PARA VER O ERRO ---
-    if resp_webhook.status_code != 200:
-        print(f"\n🚨 ERRO DO WEBHOOK: {resp_webhook.json()}")
-    # -------------------------------------
+    assert _pagar(enviar_webhook, pid).status_code == 200
+    assert client.get(f"/pedidos/{pid}").json()["status"] == "PAGO"
 
-    assert resp_webhook.status_code == 200
+    fila_cozinha = client.get("/pedidos/?status=PAGO").json()
+    assert [p["id"] for p in fila_cozinha] == [pid]
 
-    # Verifica se mudou para PAGO
-    resp_consulta = client.get(f"/pedidos/{id_pedido}")
-    assert resp_consulta.json()["status"] == "PAGO"
+    for proximo in ("PREPARANDO", "PRONTO", "ENTREGUE"):
+        r = client.patch(f"/pedidos/{pid}", json={"status": proximo})
+        assert r.status_code == 200
+        assert r.json()["status"] == proximo
 
-    # --- CENÁRIO: COZINHA (FILTRO) ---
-    # Cozinha pede apenas os PAGOS
-    resp_cozinha = client.get("/pedidos/?status=PAGO")
-    lista_cozinha = resp_cozinha.json()
-    assert len(lista_cozinha) == 1
-    assert lista_cozinha[0]["id"] == id_pedido
 
-    # --- CENÁRIO: AVANÇAR STATUS (FSM) ---
-    # Tenta avançar para PREPARANDO
-    payload_status = {"status": "PREPARANDO"}
-    resp_patch = client.patch(f"/pedidos/{id_pedido}", json=payload_status)
-    assert resp_patch.status_code == 200
-    assert resp_patch.json()["status"] == "PREPARANDO"
+# --- Máquina de estados ---
 
-    # --- CENÁRIO: TENTATIVA DE ERRO (BLINDAGEM) ---
-    # Tenta voltar para CRIADO (deve falhar)
-    payload_invalido = {"status": "CRIADO"}
-    resp_erro = client.patch(f"/pedidos/{id_pedido}", json=payload_invalido)
-    assert resp_erro.status_code == 400  # Bad Request
-    assert "Transicao invalida" in resp_erro.json()["detail"]
+def test_patch_nao_marca_como_pago(client, pedido_criado):
+    r = client.patch(f"/pedidos/{pedido_criado['id']}", json={"status": "PAGO"})
+    assert r.status_code == 400
+
+
+def test_transicao_para_tras_e_bloqueada(client, enviar_webhook, pedido_criado):
+    pid = pedido_criado["id"]
+    _pagar(enviar_webhook, pid)
+    client.patch(f"/pedidos/{pid}", json={"status": "PREPARANDO"})
+    r = client.patch(f"/pedidos/{pid}", json={"status": "CRIADO"})
+    assert r.status_code == 400
+    assert "Transição inválida" in r.json()["detail"]
+
+
+def test_pedido_cancelado_nao_pode_ser_pago(client, enviar_webhook, pedido_criado):
+    pid = pedido_criado["id"]
+    client.patch(f"/pedidos/{pid}", json={"status": "CANCELADO"})
+    assert _pagar(enviar_webhook, pid).status_code == 409
+    assert client.get(f"/pedidos/{pid}").json()["status"] == "CANCELADO"
+
+
+def test_webhook_nao_regride_pedido_em_preparo(client, enviar_webhook, pedido_criado):
+    pid = pedido_criado["id"]
+    _pagar(enviar_webhook, pid, tx="tx_1")
+    client.patch(f"/pedidos/{pid}", json={"status": "PREPARANDO"})
+    assert _pagar(enviar_webhook, pid, tx="tx_2").status_code == 409
+    assert client.get(f"/pedidos/{pid}").json()["status"] == "PREPARANDO"
+
+
+# --- Webhook: segurança e idempotência ---
+
+def test_webhook_sem_assinatura_valida_e_rejeitado(client, enviar_webhook, pedido_criado):
+    r = enviar_webhook(
+        {"pedido_id": pedido_criado["id"], "status_transacao": "aprovado", "id_transacao_gateway": "tx"},
+        assinatura="forjada",
+    )
+    assert r.status_code == 401
+    assert client.get(f"/pedidos/{pedido_criado['id']}").json()["status"] == "CRIADO"
+
+
+def test_reentrega_da_mesma_transacao_e_idempotente(client, enviar_webhook, pedido_criado):
+    pid = pedido_criado["id"]
+    _pagar(enviar_webhook, pid, tx="tx_dup")
+    client.patch(f"/pedidos/{pid}", json={"status": "PREPARANDO"})
+    r = _pagar(enviar_webhook, pid, tx="tx_dup")
+    assert r.status_code == 200
+    assert client.get(f"/pedidos/{pid}").json()["status"] == "PREPARANDO"
+
+
+def test_mesma_transacao_nao_paga_dois_pedidos(client, enviar_webhook, pedido_criado):
+    produto_id = pedido_criado["itens"][0]["produto_id"]
+    outro = client.post("/pedidos/", json={"itens": [{"produto_id": produto_id, "quantidade": 1}]}).json()
+    _pagar(enviar_webhook, pedido_criado["id"], tx="tx_unica")
+    assert _pagar(enviar_webhook, outro["id"], tx="tx_unica").status_code == 409
+
+
+def test_pagamento_recusado_nao_altera_pedido(client, enviar_webhook, pedido_criado):
+    r = _pagar(enviar_webhook, pedido_criado["id"], status="recusado")
+    assert r.status_code == 200
+    assert client.get(f"/pedidos/{pedido_criado['id']}").json()["status"] == "CRIADO"
+
+
+# --- Cardápio ---
+
+def test_preco_do_pedido_fica_congelado(client, pedido_criado):
+    produto_id = pedido_criado["itens"][0]["produto_id"]
+    r = client.patch(f"/produtos/{produto_id}", json={"preco": "40.00"})
+    assert r.status_code == 200
+    assert Decimal(client.get(f"/produtos/{produto_id}").json()["preco_atual"]) == Decimal("40.00")
+    assert Decimal(client.get(f"/pedidos/{pedido_criado['id']}").json()["total"]) == Decimal("70.00")
+
+
+def test_pedido_com_produto_inexistente(client):
+    r = client.post("/pedidos/", json={"itens": [{"produto_id": 999, "quantidade": 1}]})
+    assert r.status_code == 404
